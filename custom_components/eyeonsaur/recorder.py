@@ -4,21 +4,55 @@
 
 import logging
 from datetime import datetime, timedelta
+from typing import Any, cast
 
 from homeassistant.components.recorder.models import (
     StatisticData,
     StatisticMetaData,
 )
 from homeassistant.components.recorder.statistics import (
-    # StatisticData,
-    # StatisticMetaData,
     async_import_statistics,
 )
 from homeassistant.const import UnitOfVolume
 from homeassistant.core import HomeAssistant
 from homeassistant.util.dt import as_local
 
+try:
+    # Présent à partir de HA 2025.11, obligatoire en 2026.11.
+    from homeassistant.components.recorder.models import StatisticMeanType
+except ImportError:  # HA <= 2025.10
+    StatisticMeanType = None  # type: ignore[misc, assignment]
+
+try:
+    from homeassistant.util.unit_conversion import VolumeConverter
+
+    _VOLUME_UNIT_CLASS: str | None = VolumeConverter.UNIT_CLASS
+except (ImportError, AttributeError):  # HA très ancien
+    _VOLUME_UNIT_CLASS = "volume"
+
 _LOGGER = logging.getLogger(__name__)
+
+
+def statistic_metadata(statistic_id: str) -> StatisticMetaData:
+    """Métadonnées d'une statistique de somme (volume, sans moyenne).
+
+    `mean_type` et `unit_class` sont exigés par `async_import_statistics`
+    à partir de Home Assistant 2026.11. Les cores plus anciens rejettent
+    ces clés dans `StatisticsMeta.from_meta` : on ne les ajoute que si
+    `StatisticMeanType` est importable.
+    """
+    metadata: dict[str, Any] = {
+        "has_mean": False,
+        "has_sum": True,
+        "name": f"EyeOnSaur Consumption of {statistic_id}",
+        "source": "recorder",
+        "statistic_id": statistic_id,
+        "unit_of_measurement": UnitOfVolume.CUBIC_METERS,
+    }
+    if StatisticMeanType is not None:
+        metadata["mean_type"] = StatisticMeanType.NONE
+        metadata["unit_class"] = _VOLUME_UNIT_CLASS
+    return cast("StatisticMetaData", metadata)
 
 
 class SaurRecorder:
@@ -56,14 +90,7 @@ class SaurRecorder:
         end_of_day = datetime(date.year, date.month, date.day, 23, 59, 59)
         end_of_day = as_local(end_of_day)
 
-        metadata: StatisticMetaData = StatisticMetaData(
-            has_mean=False,
-            has_sum=True,
-            name=f"EyeOnSaur Consumption of {statistic_id}",
-            source="recorder",
-            statistic_id=statistic_id,
-            unit_of_measurement=UnitOfVolume.CUBIC_METERS,
-        )
+        metadata = statistic_metadata(statistic_id)
 
         interval = timedelta(hours=1)
         stats: list[StatisticData] = []

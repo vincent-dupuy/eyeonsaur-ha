@@ -1,7 +1,10 @@
 """Test the EyeOnSaur dateutils module."""
 
+import pytest
+
 from custom_components.eyeonsaur.helpers.dateutils import (
     find_missing_dates,
+    iter_year_months,
     sync_reduce_missing_dates,
 )
 from custom_components.eyeonsaur.models import (
@@ -209,3 +212,29 @@ def test_sync_reduce_missing_dates_multiple_periods() -> None:
             MissingDate(2024, 2, 5),
         ]
     )
+
+
+def test_iter_year_months_same_month() -> None:
+    """Un seul mois quand début et fin coïncident."""
+    assert iter_year_months(2026, 10, 2026, 10) == [(2026, 10)]
+
+
+def test_iter_year_months_spans_year() -> None:
+    """Le backfill traverse le changement d'année."""
+    assert iter_year_months(2025, 11, 2026, 2) == [
+        (2025, 11),
+        (2025, 12),
+        (2026, 1),
+        (2026, 2),
+    ]
+
+
+def test_iter_year_months_empty_when_start_after_end() -> None:
+    """Aucune requête si l'installation est dans le futur."""
+    assert iter_year_months(2026, 12, 2026, 3) == []
+
+
+def test_iter_year_months_rejects_invalid_month() -> None:
+    """Un mois hors 1..12 est rejeté."""
+    with pytest.raises(ValueError, match="Mois invalide"):
+        iter_year_months(2026, 0, 2026, 1)

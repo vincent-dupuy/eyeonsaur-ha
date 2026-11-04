@@ -112,3 +112,33 @@ def sync_reduce_missing_dates(
             last_added_date = current_date
 
     return optimized_dates
+
+
+def iter_year_months(
+    start_year: int,
+    start_month: int,
+    end_year: int,
+    end_month: int,
+) -> list[tuple[int, int]]:
+    """Liste les mois inclus entre deux bornes (année, mois).
+
+    Sert au backfill : si le mois d'installation est vide, il faut
+    quand même interroger les mois suivants jusqu'à aujourd'hui.
+    """
+    if not 1 <= start_month <= 12 or not 1 <= end_month <= 12:
+        message = (
+            f"Mois invalide : {start_year}-{start_month}"
+            f" → {end_year}-{end_month}"
+        )
+        raise ValueError(message)
+
+    year, month = start_year, start_month
+    months: list[tuple[int, int]] = []
+    while (year, month) <= (end_year, end_month):
+        months.append((year, month))
+        if month == 12:
+            year += 1
+            month = 1
+        else:
+            month += 1
+    return months
