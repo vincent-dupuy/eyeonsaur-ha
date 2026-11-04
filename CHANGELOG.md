@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),  
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v1.1.13-vd1] - 2026-11-04
+
+### Fixed
+- 🛠️ Index théorique calculé même si la date d'ancre (relevé technicien) n'est pas dans la table journalière : cumul recalé sur la date la plus proche, puis accumulation avant / arrière
+- 🛠️ Les erreurs de conversion ne sont plus avalées par `print()`, elles sont journalisées
+- 🛠️ Le backfill initial récupère tous les mois entre l'installation et le mois courant (plus de blocage si le premier mois est vide)
+- 🛠️ Compatibilité Home Assistant 2026.11 : `mean_type=StatisticMeanType.NONE` et `unit_class` volume pour les statistiques de somme, avec repli pour les versions antérieures
+
 ## [v1.1.11] - 2024-02-28 (+v1.1.9 + fix DEV + FIX pypi + fix UTC)
 
 ### Added

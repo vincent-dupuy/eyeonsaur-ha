@@ -22,6 +22,47 @@ from ..models import (
 _LOGGER = logging.getLogger(__name__)
 
 
+def _consumption_from_row(
+    row: sqlite3.Row,
+) -> TheoreticalConsumptionData | None:
+    """Convertit une ligne SQL en index théorique.
+
+    Retourne None et journalise l'erreur si la ligne est inexploitable.
+    """
+    raw_date = row["date"]
+    raw_absolute = row["absolute_value"]
+    if raw_absolute is None:
+        _LOGGER.error(
+            "Valeur absolue absente pour la date %s "
+            "(ancre non rattachée à la table journalière)",
+            raw_date,
+        )
+        return None
+    try:
+        date_str = StrDate(
+            datetime.fromisoformat(str(raw_date)).strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+        )
+        return TheoreticalConsumptionData(
+            date=date_str,
+            indexValue=float(raw_absolute),
+        )
+    except ValueError as err:
+        _LOGGER.error(
+            "Date invalide détectée : %s -> %s",
+            raw_date,
+            err,
+        )
+    except Exception as err:
+        _LOGGER.error(
+            "Erreur lors de la création du TheoreticalConsumptionData : %s",
+            err,
+            exc_info=True,
+        )
+    return None
+
+
 class SaurDatabaseError(Exception):
     """Exception levée lors d'erreurs de base de données Saur."""
 
@@ -259,33 +300,45 @@ class SaurDatabaseHelper:
             "async_get_all_consumptions_with_absolute pour %s", section_id
         )
 
+        # L'ancre (relevé technicien) n'a pas forcément la même date
+        # qu'une ligne journalière. On recale le cumul sur la journée
+        # la plus proche antérieure ou égale ; s'il n'y en a pas
+        # (ancre avant toute consommation), le cumul de référence est 0.
+        # Les index se déduisent ensuite en accumulant les consommations
+        # vers l'avant et vers l'arrière.
         query = """
             WITH Anchor AS (
-            SELECT date, value FROM anchor_value WHERE section_id = ?
+                SELECT date, value FROM anchor_value
+                WHERE section_id = ?
+                ORDER BY date DESC LIMIT 1
             ),
             ConsumptionsWithCumulative AS (
-            SELECT
-                c.date,
-                c.relative_value,
-                SUM(c.relative_value) OVER (ORDER BY c.date ASC)
-                AS cumulative_relative
-            FROM consumptions c WHERE c.section_id = ?
+                SELECT
+                    c.date,
+                    c.relative_value,
+                    SUM(c.relative_value) OVER (ORDER BY c.date ASC)
+                        AS cumulative_relative
+                FROM consumptions c WHERE c.section_id = ?
             ),
-            AbsoluteValues AS (
-            SELECT
-                cw.date, cw.relative_value,
-                CASE
-                WHEN cw.date = (SELECT date FROM Anchor)
-                THEN (SELECT value FROM Anchor)
-                ELSE (SELECT value FROM Anchor) + cw.cumulative_relative
-                - (SELECT cumulative_relative
-                    FROM ConsumptionsWithCumulative
-                    WHERE date = (SELECT date FROM Anchor))
-                END AS absolute_value
-            FROM ConsumptionsWithCumulative cw
+            ReferenceCumulative AS (
+                SELECT cumulative_relative
+                FROM ConsumptionsWithCumulative
+                WHERE date <= (SELECT date FROM Anchor)
+                ORDER BY date DESC
+                LIMIT 1
             )
-            SELECT date, relative_value, absolute_value FROM AbsoluteValues
-            ORDER BY date DESC;
+            SELECT
+                cw.date,
+                cw.relative_value,
+                COALESCE((SELECT value FROM Anchor), 0)
+                    + cw.cumulative_relative
+                    - COALESCE(
+                        (SELECT cumulative_relative FROM ReferenceCumulative),
+                        0
+                    )
+                    AS absolute_value
+            FROM ConsumptionsWithCumulative cw
+            ORDER BY cw.date DESC;
         """
 
         results = await self._async_execute_query(
@@ -306,28 +359,16 @@ class SaurDatabaseHelper:
 
         if results:
             for row in results:
-                try:
-                    date_str: StrDate = StrDate(
-                        datetime.fromisoformat(row["date"]).strftime(
-                            "%Y-%m-%d %H:%M:%S"
-                        )
-                    )
-                    absolute_value: float = float(row["absolute_value"])
+                data_point = _consumption_from_row(row)
+                if data_point is not None:
+                    formatted_results.append(data_point)
 
-                    data_point: TheoreticalConsumptionData = (
-                        TheoreticalConsumptionData(
-                            date=date_str, indexValue=absolute_value
-                        )
-                    )
-                    formatted_results.append(
-                        data_point
-                    )  # Assuming append is the correct method
-                except ValueError as e:
-                    print(f"⚠️ Date invalide détectée : {row['date']} -> {e}")
-                except Exception as e:
-                    print(
-                        "⚠️ Erreur lors de la création du "
-                        f"TheoreticalConsumptionData : {e}"
-                    )
+        if results and not formatted_results:
+            _LOGGER.error(
+                "Aucune valeur absolue exploitable pour %s "
+                "(%s lignes SQL ignorées)",
+                section_id,
+                nb_results,
+            )
 
         return formatted_results

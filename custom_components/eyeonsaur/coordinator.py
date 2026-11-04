@@ -38,7 +38,11 @@ from .helpers.const import (
     ENTRY_TOKEN,
     POLLING_INTERVAL,
 )
-from .helpers.dateutils import find_missing_dates, sync_reduce_missing_dates
+from .helpers.dateutils import (
+    find_missing_dates,
+    iter_year_months,
+    sync_reduce_missing_dates,
+)
 from .helpers.saur_db import SaurDatabaseHelper
 from .models import (
     ConsumptionData,
@@ -189,14 +193,35 @@ class SaurCoordinator(DataUpdateCoordinator[SaurData]):
             date_installation = as_local(
                 datetime.fromisoformat(compteur.releve_physique.date)
             )
-            task = self.hass.async_create_task(
-                self._async_fetch_monthly_data(
-                    year=date_installation.year,
-                    month=date_installation.month,
-                    compteur=compteur,
-                )
+            # Le backfill via les dates manquantes ne progresse que
+            # s'il existe déjà des consommations. Un mois d'installation
+            # vide bloquait donc toute la suite. On planifie chaque mois
+            # jusqu'au mois courant.
+            now_local = hass_now()
+            months = iter_year_months(
+                date_installation.year,
+                date_installation.month,
+                now_local.year,
+                now_local.month,
             )
-            self._background_tasks.append(task)
+            _LOGGER.debug(
+                "Backfill mensuel de %s mois (%s-%02d → %s-%02d) pour %s",
+                len(months),
+                date_installation.year,
+                date_installation.month,
+                now_local.year,
+                now_local.month,
+                compteur.sectionId,
+            )
+            for year, month in months:
+                task = self.hass.async_create_task(
+                    self._async_fetch_monthly_data(
+                        year=year,
+                        month=month,
+                        compteur=compteur,
+                    )
+                )
+                self._background_tasks.append(task)
         # await asyncio.gather(*self._background_tasks)
         await super().async_config_entry_first_refresh()
 

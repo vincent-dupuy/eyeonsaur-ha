@@ -1,5 +1,6 @@
 # tests/test_saur_db.py
 import asyncio
+import logging
 import os
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
@@ -12,6 +13,7 @@ from homeassistant.core import HomeAssistant
 from custom_components.eyeonsaur.helpers.saur_db import (
     SaurDatabaseError,
     SaurDatabaseHelper,
+    _consumption_from_row,
 )
 from custom_components.eyeonsaur.models import (
     ConsumptionData,
@@ -514,3 +516,209 @@ async def test_async_get_all_consumptions_with_absolute3(
         expected_date = ordered_dates[i]
         assert str(row.date) == expected_date
         assert row.indexValue == pytest.approx(expected_values[expected_date])
+
+
+ANCHOR_SECTION_ID: Final[SectionId] = SectionId("anchor_cases")
+
+
+def _index_by_date(
+    result: TheoreticalConsumptionDatas,
+) -> dict[str, float]:
+    """Indexe les index théoriques par date."""
+    return {str(row.date): row.indexValue for row in result}
+
+
+async def _seed_anchor_case(
+    db_helper: SaurDatabaseHelper,
+    rows: list[tuple[str, float]],
+    anchor_date: str,
+    anchor_value: float,
+) -> TheoreticalConsumptionDatas:
+    """Insère des journées et une ancre, puis calcule les index."""
+    consumptions = ConsumptionDatas(
+        [
+            ConsumptionData(
+                startDate=StrDate(date),
+                value=value,
+                rangeType="Day",
+            )
+            for date, value in rows
+        ]
+    )
+    await db_helper.async_write_consumptions(consumptions, ANCHOR_SECTION_ID)
+    await db_helper.async_update_anchor(
+        RelevePhysique(date=StrDate(anchor_date), valeur=anchor_value),
+        ANCHOR_SECTION_ID,
+    )
+    return await db_helper.async_get_all_consumptions_with_absolute(
+        ANCHOR_SECTION_ID
+    )
+
+
+async def test_absolute_anchor_date_present(
+    db_helper: SaurDatabaseHelper,
+) -> None:
+    """L'ancre tombe sur une journée connue : son index est repris tel quel."""
+    result = await _seed_anchor_case(
+        db_helper,
+        rows=[
+            ("2026-10-03 00:00:00", 1.5),
+            ("2026-10-04 00:00:00", 2.5),
+            ("2026-10-05 00:00:00", 0.8),
+            ("2026-10-06 00:00:00", 0.4),
+            ("2026-10-07 00:00:00", 0.6),
+        ],
+        anchor_date="2026-10-05 00:00:00",
+        anchor_value=100.0,
+    )
+    indexes = _index_by_date(result)
+    assert indexes == pytest.approx(
+        {
+            # La conso du jour d'ancre (0.8) est déjà dans l'index 100.
+            "2026-10-03 00:00:00": 96.7,  # 100 - 2.5 - 0.8
+            "2026-10-04 00:00:00": 99.2,  # 100 - 0.8
+            "2026-10-05 00:00:00": 100.0,
+            "2026-10-06 00:00:00": 100.4,
+            "2026-10-07 00:00:00": 101.0,
+        }
+    )
+
+
+async def test_absolute_anchor_date_between_readings(
+    db_helper: SaurDatabaseHelper,
+) -> None:
+    """Ancre absente de la table : on accumule depuis les dates voisines."""
+    result = await _seed_anchor_case(
+        db_helper,
+        rows=[
+            ("2026-10-03 00:00:00", 1.5),
+            ("2026-10-04 00:00:00", 2.5),
+            ("2026-10-06 00:00:00", 0.4),
+            ("2026-10-07 00:00:00", 0.6),
+        ],
+        anchor_date="2026-10-05 00:00:00",
+        anchor_value=100.0,
+    )
+    assert len(result) == 4
+    indexes = _index_by_date(result)
+    assert indexes == pytest.approx(
+        {
+            # Jour le plus proche avant l'ancre : index = ancre.
+            # Puis recul (2.5) et avance (0.4, 0.6).
+            "2026-10-03 00:00:00": 97.5,
+            "2026-10-04 00:00:00": 100.0,
+            "2026-10-06 00:00:00": 100.4,
+            "2026-10-07 00:00:00": 101.0,
+        }
+    )
+
+
+async def test_absolute_anchor_before_all_readings(
+    db_helper: SaurDatabaseHelper,
+) -> None:
+    """Ancre antérieure à toute consommation : on additionne depuis 0."""
+    result = await _seed_anchor_case(
+        db_helper,
+        rows=[
+            ("2026-10-06 00:00:00", 0.4),
+            ("2026-10-07 00:00:00", 0.6),
+        ],
+        anchor_date="2026-10-05 00:00:00",
+        anchor_value=100.0,
+    )
+    indexes = _index_by_date(result)
+    assert indexes == pytest.approx(
+        {
+            "2026-10-06 00:00:00": 100.4,
+            "2026-10-07 00:00:00": 101.0,
+        }
+    )
+
+
+async def test_absolute_invalid_date_is_logged(
+    db_helper: SaurDatabaseHelper,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Une date illisible est journalisée, les autres lignes restent."""
+    await db_helper._async_execute_query(
+        """
+        INSERT INTO consumptions (date, section_id, relative_value, is_ancre)
+        VALUES (?, ?, ?, 0)
+        """,
+        ("pas-une-date", ANCHOR_SECTION_ID, 1.0),
+    )
+    with caplog.at_level(logging.ERROR):
+        result = await _seed_anchor_case(
+            db_helper,
+            rows=[("2026-10-06 00:00:00", 0.4)],
+            anchor_date="2026-10-05 00:00:00",
+            anchor_value=100.0,
+        )
+
+    indexes = _index_by_date(result)
+    assert indexes == pytest.approx({"2026-10-06 00:00:00": 100.4})
+    assert "pas-une-date" in caplog.text
+    assert "Date invalide" in caplog.text
+
+
+async def test_absolute_only_invalid_rows_are_logged(
+    db_helper: SaurDatabaseHelper,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Si toutes les lignes échouent, l'échec global est journalisé."""
+    await db_helper._async_execute_query(
+        """
+        INSERT INTO consumptions (date, section_id, relative_value, is_ancre)
+        VALUES (?, ?, ?, 0)
+        """,
+        ("pas-une-date", ANCHOR_SECTION_ID, 1.0),
+    )
+    await db_helper.async_update_anchor(
+        RelevePhysique(
+            date=StrDate("2026-10-05 00:00:00"),
+            valeur=100.0,
+        ),
+        ANCHOR_SECTION_ID,
+    )
+    with caplog.at_level(logging.ERROR):
+        result = await db_helper.async_get_all_consumptions_with_absolute(
+            ANCHOR_SECTION_ID
+        )
+
+    assert result == []
+    assert "Aucune valeur absolue exploitable" in caplog.text
+
+
+async def test_consumption_from_row_logs_null_absolute(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Une valeur absolue NULL est journalisée, pas ignorée en silence."""
+
+    class _Row:
+        def __getitem__(self, key: str) -> object:
+            return {
+                "date": "2026-10-05 00:00:00",
+                "absolute_value": None,
+            }[key]
+
+    with caplog.at_level(logging.ERROR):
+        assert _consumption_from_row(_Row()) is None  # type: ignore[arg-type]
+    assert "Valeur absolue absente" in caplog.text
+
+
+async def test_consumption_from_row_logs_unexpected_error(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Une erreur inattendue (ex. float(None) historique) est journalisée."""
+
+    class _Row:
+        def __getitem__(self, key: str) -> object:
+            if key == "absolute_value":
+                return object()
+            if key == "date":
+                return "2026-10-05 00:00:00"
+            raise KeyError(key)
+
+    with caplog.at_level(logging.ERROR):
+        assert _consumption_from_row(_Row()) is None  # type: ignore[arg-type]
+    assert "TheoreticalConsumptionData" in caplog.text
